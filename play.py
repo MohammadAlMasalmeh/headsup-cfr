@@ -5,6 +5,8 @@ Play Heads-Up No-Limit Texas Hold'em Against a Deep CFR Bot
 
 import os
 import sys
+import tty
+import termios
 import random
 import argparse
 from hand_eval import make_deck, card_str, hand_str, best_hand, hand_name
@@ -41,7 +43,7 @@ def render_card(card):
 
 
 def clear_screen():
-    print('\033[2J\033[H', end='')
+    print('\033[H\033[J', end='')
 
 
 # Game State
@@ -85,6 +87,7 @@ class Game:
         self.winner = -1
         self.human_rank = None
         self.bot_rank = None
+        self.action_log = []  # [(street, who, action, amount)]
 
     def visible_board(self):
         if self.street <= 0: return []
@@ -146,15 +149,18 @@ class Game:
         cp = self.cp
         opp = 1 - cp
         tc = self.to_call()
+        who = 'You' if cp == self.human_seat else 'Bot'
 
         self.street_hist += action
 
         if action == 'f':
+            self.action_log.append((self.street, who, 'fold', 0))
             self.done = True
             self.winner = opp
             return
 
         if action == 'x':
+            self.action_log.append((self.street, who, 'check', 0))
             if len(self.street_hist) >= 2 and self.street_hist[-2] == 'x':
                 self._next_street()
             else:
@@ -163,6 +169,7 @@ class Game:
 
         if action == 'c':
             amt = min(tc, self.stacks[cp])
+            self.action_log.append((self.street, who, 'call', amt))
             self.bets[cp] += amt
             self.stacks[cp] -= amt
 
@@ -173,6 +180,8 @@ class Game:
             return
 
         amt = self.bet_amount(action)
+        label = 'raise' if self.facing_bet() else 'bet'
+        self.action_log.append((self.street, who, label, self.bets[cp] + amt))
         self.bets[cp] += amt
         self.stacks[cp] -= amt
         self.n_bets += 1
@@ -296,35 +305,83 @@ def show_menu(g: Game):
     return actions
 
 
-def show_bot_action(g: Game, action):
+def bot_action_msg(g: Game, action):
     amt = g.bet_amount(action)
     tc = g.to_call()
     facing = g.facing_bet()
 
     if action == 'f':
-        msg = "Bot folds"
+        return "Bot folds"
     elif action == 'x':
-        msg = "Bot checks"
+        return "Bot checks"
     elif action == 'c':
-        msg = f"Bot calls {tc}"
+        return f"Bot calls {tc}"
     elif action == 'h':
         if facing:
-            msg = f"Bot raises to {g.bets[g.cp] + amt}"
+            return f"Bot raises to {g.bets[g.cp] + amt}"
         else:
-            msg = f"Bot bets {amt}"
+            return f"Bot bets {amt}"
     elif action == 'b':
         if facing:
-            msg = f"Bot raises to {g.bets[g.cp] + amt}"
+            return f"Bot raises to {g.bets[g.cp] + amt}"
         else:
-            msg = f"Bot bets {amt}"
-    else:
-        msg = f"Bot: {action}"
+            return f"Bot bets {amt}"
+    return f"Bot: {action}"
 
-    print(f" {DIM}>> {msg}{RESET}")
-    input(f" {DIM}(press enter){RESET}")
+
+def hand_log(g: Game, net):
+    """Print a compact hand summary that stays in scroll history."""
+    pos = "BTN" if g.human_is_button else "BB"
+    print(f"\n {DIM}{'─' * 44}{RESET}")
+    print(f" {BOLD}Hand #{g.hand_num}{RESET}  {DIM}You: {pos}{RESET}  ", end='')
+
+    if net > 0:
+        print(f"{GREEN}+{net:.0f}{RESET}")
+    elif net < 0:
+        print(f"{RED}{net:.0f}{RESET}")
+    else:
+        print(f"{YELLOW}split{RESET}")
+
+    # Hands
+    print(f" You: {render_card(g.human_hand[0])} {render_card(g.human_hand[1])}", end='')
+    if g.human_rank is not None:
+        print(f"  {DIM}{hand_name(g.human_rank)}{RESET}")
+    else:
+        print()
+    print(f" Bot: {render_card(g.bot_hand[0])} {render_card(g.bot_hand[1])}", end='')
+    if g.bot_rank is not None:
+        print(f"  {DIM}{hand_name(g.bot_rank)}{RESET}")
+    else:
+        print(f"  {DIM}mucked{RESET}")
+
+    # Board
+    if g.human_rank is not None:
+        board_str = '  '.join(render_card(c) for c in g.board)
+    else:
+        vis = g.visible_board()
+        board_str = '  '.join(render_card(c) for c in vis) if vis else f"{DIM}(preflop){RESET}"
+    print(f" Board: {board_str}")
+
+    # Action summary by street
+    for st in range(4):
+        acts = [(who, act, amt) for s, who, act, amt in g.action_log if s == st]
+        if not acts:
+            break
+        parts = []
+        for who, act, amt in acts:
+            if act in ('check', 'fold'):
+                parts.append(f"{who} {act}s" if who == 'Bot' else f"{who} {act}")
+            elif act == 'call':
+                parts.append(f"{who} call{'s' if who == 'Bot' else ''} {amt}")
+            else:
+                parts.append(f"{who} {act}s {amt}" if who == 'Bot' else f"{who} {act} {amt}")
+        print(f" {DIM}{STREET_NAMES[st]}: {', '.join(parts)}{RESET}")
+
+    print(f" {DIM}Chips  You: {g.human_chips:.0f}  |  Bot: {g.bot_chips:.0f}{RESET}")
 
 
 def show_result(g: Game, net):
+    """Show result on the live screen (gets cleared next hand)."""
     clear_screen()
     print()
 
@@ -335,6 +392,11 @@ def show_result(g: Game, net):
         print(f" You:  {render_card(g.human_hand[0])}  {render_card(g.human_hand[1])}  {DIM}{hand_name(g.human_rank)}{RESET}")
         print(f" Bot:  {render_card(g.bot_hand[0])}  {render_card(g.bot_hand[1])}  {DIM}{hand_name(g.bot_rank)}{RESET}")
     else:
+        vis = g.visible_board()
+        if vis:
+            board_str = '  '.join(render_card(c) for c in vis)
+            print(f"   {board_str}\n")
+        print(f" You:  {render_card(g.human_hand[0])}  {render_card(g.human_hand[1])}")
         b = g.bot_hand
         print(f" Bot mucked: {render_card(b[0])}  {render_card(b[1])}")
 
@@ -369,21 +431,46 @@ def play_hand(g: Game, bot: DeepCFRBot, bot_rng):
                 1 if g.bot_seat == 0 else 0,
                 bot_rng
             )
-            show_bot_action(g, a)
+            msg = bot_action_msg(g, a)
             g.apply(a)
+            if not g.done:
+                show_state(g)
+            print(f" {DIM}>> {msg}{RESET}")
+            print(f" {DIM}(any key){RESET}")
+            ch = getch()
+            if ch in ('\x03', '\x04'):
+                raise KeyboardInterrupt
 
     net = g.settle()
-    show_result(g, net)
+    hand_log(g, net)      # compact log stays in scroll history
+    show_result(g, net)   # full result on live screen (cleared next hand)
+
+
+def getch():
+    """Read a single keypress without waiting for Enter."""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return ch
 
 
 def get_input(actions):
     try:
-        raw = input(f" {BOLD}>{RESET} ").strip()
-        idx = int(raw) - 1
+        sys.stdout.write(f" {BOLD}>{RESET} ")
+        sys.stdout.flush()
+        ch = getch()
+        if ch in ('\x03', '\x04'):  # Ctrl-C / Ctrl-D
+            raise KeyboardInterrupt
+        print(ch)  # echo the key
+        idx = int(ch) - 1
         if 0 <= idx < len(actions):
             return actions[idx]
     except (ValueError, EOFError, KeyboardInterrupt):
-        pass
+        raise KeyboardInterrupt
     print(f" {DIM}Pick a number{RESET}")
     return None
 
@@ -421,7 +508,8 @@ def main():
     print(f"\n {BOLD}Heads-Up No-Limit Hold'em{RESET}")
     print(f" {DIM}{args.stack} chips  |  blinds {args.sb}/{args.bb}{RESET}")
     print(f" {DIM}{'─' * 44}{RESET}")
-    input(f"\n {DIM}Press enter to start{RESET}")
+    print(f"\n {DIM}Press any key to start{RESET}")
+    getch()
 
     hand_num = 0
     while True:
@@ -439,8 +527,11 @@ def main():
         play_hand(g, bot, bot_rng)
 
         print()
+        sys.stdout.write(f" {DIM}Next hand? [Y/n]{RESET} ")
+        sys.stdout.flush()
         try:
-            ans = input(f" {DIM}Next hand? [Y/n]{RESET} ").strip().lower()
+            ans = getch().lower()
+            print(ans)
         except (EOFError, KeyboardInterrupt):
             ans = 'n'
         if ans == 'n':
